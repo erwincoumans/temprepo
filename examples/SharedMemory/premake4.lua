@@ -466,6 +466,7 @@ end
 
 include "udp"
 include "tcp"
+
 include "plugins/testPlugin"
 include "plugins/vrSyncPlugin"
 include "plugins/tinyRendererPlugin"
@@ -473,3 +474,7 @@ include "plugins/tinyRendererPlugin"
 include "plugins/pdControlPlugin"
 include "plugins/collisionFilterPlugin"
 
+if _OPTIONS["enable_grpc"] then
+		include "grpc"
+		include "plugins/grpcPlugin"
+end

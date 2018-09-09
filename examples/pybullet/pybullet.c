@@ -14,6 +14,9 @@
 #include "../SharedMemory/mujoco/MuJoCoPhysicsC_API.h"
 #endif
 
+#ifdef BT_ENABLE_GRPC
+#include "../SharedMemory/PhysicsClientGRPC_C_API.h"
+#endif
 #ifdef BT_ENABLE_CLSOCKET
 #include "../SharedMemory/PhysicsClientTCP_C_API.h"
 #endif  //BT_ENABLE_CLSOCKET
@@ -431,7 +434,15 @@ static PyObject* pybullet_connectPhysicsServer(PyObject* self, PyObject* args, P
 				break;
 			}
 #endif
-
+			case eCONNECT_GRPC:
+			{
+#ifdef BT_ENABLE_GRPC
+				sm = b3ConnectPhysicsGRPC(hostName, tcpPort);
+#else
+				PyErr_SetString(SpamError, "GRPC is not enabled in this pybullet build");
+#endif
+				break;
+		}
 			case eCONNECT_SHARED_MEMORY:
 			{
 				sm = b3ConnectSharedMemory(key);
@@ -8400,7 +8411,7 @@ static PyObject* pybullet_executePluginCommand(PyObject* self,
 		PyObject* seqIntArgs = intArgs?PySequence_Fast(intArgs, "expected a sequence"):0;
 		PyObject* seqFloatArgs = floatArgs?PySequence_Fast(floatArgs, "expected a sequence"):0;
 		int numIntArgs = seqIntArgs?PySequence_Size(intArgs):0;
-		int numFloatArgs = seqIntArgs?PySequence_Size(floatArgs):0;
+		int numFloatArgs = seqFloatArgs?PySequence_Size(floatArgs):0;
 		int i;
 		for (i=0;i<numIntArgs;i++)
 		{
@@ -9588,8 +9599,12 @@ PyInit_pybullet(void)
 #ifdef BT_USE_EGL
 initpybullet_egl(void)
 #else
+#ifdef BT_PYBULLET_GRPC
+initpybullet_grpc(void)
+#else
 initpybullet(void)
 #endif //BT_USE_EGL
+#endif //BT_PYBULLET_GRPC
 #endif
 {
 	PyObject* m;
@@ -9599,8 +9614,12 @@ initpybullet(void)
 #ifdef BT_USE_EGL
 	m = Py_InitModule3("pybullet_egl", SpamMethods, "Python bindings for Bullet");
 #else
+#ifdef BT_PYBULLET_GRPC
+	m = Py_InitModule3("pybullet_grpc", SpamMethods, "Python bindings for Bullet");
+#else
 	m = Py_InitModule3("pybullet", SpamMethods, "Python bindings for Bullet");
 #endif //BT_USE_EGL
+#endif //BT_PYBULLET_GRPC
 #endif
 
 #if PY_MAJOR_VERSION >= 3
@@ -9624,6 +9643,9 @@ initpybullet(void)
 
 #ifdef BT_ENABLE_MUJOCO
 	PyModule_AddIntConstant(m, "MuJoCo", eCONNECT_MUJOCO);        // user read
+#endif
+#ifdef BT_ENABLE_GRPC
+	PyModule_AddIntConstant(m, "GRPC", eCONNECT_GRPC);        // user read
 #endif
 
 

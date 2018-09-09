@@ -21,7 +21,11 @@
     
     typedef void*                   B3_DYNLIB_HANDLE;
 
+#ifdef __APPLE__
     #define B3_DYNLIB_OPEN(path)  dlopen(path, RTLD_NOW | RTLD_GLOBAL)
+#else
+    #define B3_DYNLIB_OPEN(path)  dlmopen(LM_ID_NEWLM, path, RTLD_LAZY)
+#endif
     #define B3_DYNLIB_CLOSE       dlclose
     #define B3_DYNLIB_IMPORT      dlsym
 #endif
@@ -39,6 +43,7 @@ struct b3Plugin
 	PFN_TICK m_preTickFunc;
 	PFN_TICK m_postTickFunc;
 	PFN_TICK m_processNotificationsFunc;
+	PFN_TICK m_processClientCommandsFunc;
 
 	PFN_GET_RENDER_INTERFACE m_getRendererFunc;
 	
@@ -54,6 +59,7 @@ struct b3Plugin
 		m_preTickFunc(0),
 		m_postTickFunc(0),
 		m_processNotificationsFunc(0),
+		m_processClientCommandsFunc(0),
 		m_getRendererFunc(0),
 		m_userPointer(0)
 	{
@@ -70,8 +76,10 @@ struct b3Plugin
 		m_executeCommandFunc = 0;
 		m_preTickFunc = 0;
 		m_postTickFunc = 0;
-		m_userPointer = 0;
+		m_processNotificationsFunc = 0;
+		m_processClientCommandsFunc = 0;
 		m_getRendererFunc = 0;
+		m_userPointer = 0;
 	}
 };
 
@@ -82,15 +90,18 @@ struct b3PluginManagerInternalData
 	b3ResizablePool<b3PluginHandle> m_plugins;
 	b3HashMap<b3HashString, int> m_pluginMap;
 	PhysicsDirect* m_physicsDirect;
+	PhysicsCommandProcessorInterface* m_rpcCommandProcessorInterface;
 	b3AlignedObjectArray<b3KeyboardEvent> m_keyEvents;
 	b3AlignedObjectArray<b3VRControllerEvent> m_vrEvents;
 	b3AlignedObjectArray<b3MouseEvent> m_mouseEvents;
 	b3AlignedObjectArray<b3Notification> m_notifications[2];
 	int m_activeNotificationsBufferIndex;
 	int m_activeRendererPluginUid;
+	int m_numNotificationPlugins;
 
 	b3PluginManagerInternalData()
-		:m_activeNotificationsBufferIndex(0), m_activeRendererPluginUid(-1)
+		:m_rpcCommandProcessorInterface(0), m_activeNotificationsBufferIndex(0), m_activeRendererPluginUid(-1),
+		m_numNotificationPlugins(0)
 	{
 	}
 };
@@ -98,6 +109,7 @@ struct b3PluginManagerInternalData
 b3PluginManager::b3PluginManager(class PhysicsCommandProcessorInterface* physSdk)
 {
 	m_data = new b3PluginManagerInternalData;
+	m_data->m_rpcCommandProcessorInterface = physSdk;
 	m_data->m_physicsDirect = new PhysicsDirect(physSdk,false);
 
 }
@@ -146,7 +158,10 @@ void b3PluginManager::clearEvents()
 
 void b3PluginManager::addNotification(const struct b3Notification& notification)
 {
-	m_data->m_notifications[m_data->m_activeNotificationsBufferIndex].push_back(notification);
+	if (m_data->m_numNotificationPlugins>0)
+	{
+		m_data->m_notifications[m_data->m_activeNotificationsBufferIndex].push_back(notification);
+	}
 }
 
 int b3PluginManager::loadPlugin(const char* pluginPath, const char* postFixStr)
@@ -175,6 +190,7 @@ int b3PluginManager::loadPlugin(const char* pluginPath, const char* postFixStr)
 			std::string preTickPluginCallbackStr = std::string("preTickPluginCallback") + postFix;
 			std::string postTickPluginCallback = std::string("postTickPluginCallback") + postFix;
 			std::string processNotificationsStr = std::string("processNotifications") + postFix;
+			std::string processClientCommandsStr = std::string("processClientCommands") + postFix;
 			std::string getRendererStr = std::string("getRenderInterface") + postFix;
 
 			plugin->m_initFunc = (PFN_INIT)B3_DYNLIB_IMPORT(pluginHandle, initStr.c_str());
@@ -183,14 +199,23 @@ int b3PluginManager::loadPlugin(const char* pluginPath, const char* postFixStr)
 			plugin->m_preTickFunc = (PFN_TICK)B3_DYNLIB_IMPORT(pluginHandle, preTickPluginCallbackStr.c_str());
 			plugin->m_postTickFunc = (PFN_TICK)B3_DYNLIB_IMPORT(pluginHandle, postTickPluginCallback.c_str());
 			plugin->m_processNotificationsFunc = (PFN_TICK)B3_DYNLIB_IMPORT(pluginHandle, processNotificationsStr.c_str());
+
+			if (plugin->m_processNotificationsFunc)
+			{
+				m_data->m_numNotificationPlugins++;
+			}
+			plugin->m_processClientCommandsFunc = (PFN_TICK)B3_DYNLIB_IMPORT(pluginHandle, processClientCommandsStr.c_str());
+
 			plugin->m_getRendererFunc =  (PFN_GET_RENDER_INTERFACE)B3_DYNLIB_IMPORT(pluginHandle, getRendererStr.c_str());
-			
+		
+
 			if (plugin->m_initFunc && plugin->m_exitFunc && plugin->m_executeCommandFunc)
 			{
 
 				b3PluginContext context;
 				context.m_userPointer = plugin->m_userPointer;
 				context.m_physClient = (b3PhysicsClientHandle) m_data->m_physicsDirect;
+				context.m_rpcCommandProcessorInterface = m_data->m_rpcCommandProcessorInterface;
 				int version = plugin->m_initFunc(&context);
 				//keep the user pointer persistent
 				plugin->m_userPointer = context.m_userPointer;
@@ -253,6 +278,10 @@ void b3PluginManager::unloadPlugin(int pluginUniqueId)
 	b3PluginHandle* plugin = m_data->m_plugins.getHandle(pluginUniqueId);
 	if (plugin)
 	{
+		if (plugin->m_processNotificationsFunc)
+		{
+			m_data->m_numNotificationPlugins--;
+		}
 		b3PluginContext context = {0};
 		context.m_userPointer = plugin->m_userPointer;
 		context.m_physClient = (b3PhysicsClientHandle) m_data->m_physicsDirect;
@@ -262,8 +291,10 @@ void b3PluginManager::unloadPlugin(int pluginUniqueId)
 		m_data->m_plugins.freeHandle(pluginUniqueId);
 	}
 }
-		
-void b3PluginManager::tickPlugins(double timeStep, bool isPreTick)
+
+
+
+void b3PluginManager::tickPlugins(double timeStep, b3PluginManagerTickMode tickMode)
 {
 	for (int i=0;i<m_data->m_pluginMap.size();i++)
 	{
@@ -280,18 +311,44 @@ void b3PluginManager::tickPlugins(double timeStep, bool isPreTick)
 			continue;
 		}
 		
-		PFN_TICK  tick = isPreTick? plugin->m_preTickFunc : plugin->m_postTickFunc;
+		PFN_TICK  tick = 0;
+		switch (tickMode)
+		{
+			case B3_PRE_TICK_MODE:
+			{
+				tick = plugin->m_preTickFunc;
+				break;
+			}
+			case B3_POST_TICK_MODE:
+			{
+				tick = plugin->m_postTickFunc;
+				break;
+			}
+			case B3_PROCESS_CLIENT_COMMANDS_TICK:
+			{
+				tick = plugin->m_processClientCommandsFunc;
+				break;
+			}
+			default:
+			{
+			}
+		}
+		
 		if (tick)
 		{
-			b3PluginContext context = {0};
+			b3PluginContext context = { 0 };
 			context.m_userPointer = plugin->m_userPointer;
-			context.m_physClient = (b3PhysicsClientHandle) m_data->m_physicsDirect;
+			context.m_physClient = (b3PhysicsClientHandle)m_data->m_physicsDirect;
 			context.m_numMouseEvents = m_data->m_mouseEvents.size();
 			context.m_mouseEvents = m_data->m_mouseEvents.size() ? &m_data->m_mouseEvents[0] : 0;
 			context.m_numKeyEvents = m_data->m_keyEvents.size();
 			context.m_keyEvents = m_data->m_keyEvents.size() ? &m_data->m_keyEvents[0] : 0;
 			context.m_numVRControllerEvents = m_data->m_vrEvents.size();
-			context.m_vrControllerEvents = m_data->m_vrEvents.size()? &m_data->m_vrEvents[0]:0;
+			context.m_vrControllerEvents = m_data->m_vrEvents.size() ? &m_data->m_vrEvents[0] : 0;
+			if (tickMode == B3_PROCESS_CLIENT_COMMANDS_TICK)
+			{
+				context.m_rpcCommandProcessorInterface = m_data->m_rpcCommandProcessorInterface;
+			}
 			int result = tick(&context);
 			plugin->m_userPointer = context.m_userPointer;
 		}
@@ -346,7 +403,7 @@ int b3PluginManager::executePluginCommand(int pluginUniqueId, const b3PluginArgu
 		b3PluginContext context = {0};
 		context.m_userPointer = plugin->m_userPointer;
 		context.m_physClient = (b3PhysicsClientHandle) m_data->m_physicsDirect;
-
+		context.m_rpcCommandProcessorInterface = m_data->m_rpcCommandProcessorInterface;
 		result = plugin->m_executeCommandFunc(&context, arguments);
 		plugin->m_userPointer = context.m_userPointer;
 	}
@@ -354,7 +411,7 @@ int b3PluginManager::executePluginCommand(int pluginUniqueId, const b3PluginArgu
 }
 
 
-int b3PluginManager::registerStaticLinkedPlugin(const char* pluginPath, PFN_INIT initFunc,PFN_EXIT exitFunc, PFN_EXECUTE executeCommandFunc, PFN_TICK preTickFunc, PFN_TICK postTickFunc, PFN_GET_RENDER_INTERFACE getRendererFunc)
+int b3PluginManager::registerStaticLinkedPlugin(const char* pluginPath, PFN_INIT initFunc,PFN_EXIT exitFunc, PFN_EXECUTE executeCommandFunc, PFN_TICK preTickFunc, PFN_TICK postTickFunc, PFN_GET_RENDER_INTERFACE getRendererFunc, PFN_TICK processClientCommandsFunc)
 {
 
 	b3Plugin orgPlugin;
@@ -370,10 +427,16 @@ int b3PluginManager::registerStaticLinkedPlugin(const char* pluginPath, PFN_INIT
 	pluginHandle->m_preTickFunc = preTickFunc;
 	pluginHandle->m_postTickFunc = postTickFunc;
 	pluginHandle->m_getRendererFunc = getRendererFunc;
+	pluginHandle->m_processClientCommandsFunc = processClientCommandsFunc;
 	pluginHandle->m_pluginHandle = 0;
 	pluginHandle->m_pluginPath = pluginPath;
 	pluginHandle->m_userPointer = 0;
 	
+
+	if (pluginHandle->m_processNotificationsFunc)
+	{
+		m_data->m_numNotificationPlugins++;
+	}
 
 	m_data->m_pluginMap.insert(pluginPath, pluginUniqueId);
 
@@ -381,7 +444,7 @@ int b3PluginManager::registerStaticLinkedPlugin(const char* pluginPath, PFN_INIT
 		b3PluginContext context = {0};
 		context.m_userPointer = 0;
 		context.m_physClient = (b3PhysicsClientHandle) m_data->m_physicsDirect;
-
+		context.m_rpcCommandProcessorInterface = m_data->m_rpcCommandProcessorInterface;
 		int result = pluginHandle->m_initFunc(&context);
 		pluginHandle->m_userPointer = context.m_userPointer;
 	}
